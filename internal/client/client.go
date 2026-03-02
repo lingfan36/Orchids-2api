@@ -7,6 +7,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"log"
 	"math/rand/v2"
 	"net/http"
 	"strings"
@@ -187,37 +188,37 @@ func (c *Client) SendRequest(ctx context.Context, prompt string, chatHistory []i
 
 			lines := strings.Split(eventData, "\n")
 			for _, l := range lines {
-				if strings.HasPrefix(l, "data: ") {
-					rawData := strings.TrimPrefix(l, "data: ")
-
-					var msg map[string]interface{}
-					if err := json.Unmarshal([]byte(rawData), &msg); err != nil {
-						continue
-					}
-
-					msgType, _ := msg["type"].(string)
-
-					// 记录上游 SSE
-					if logger != nil {
-						logger.LogUpstreamSSE(msgType, rawData)
-					}
-
-					// 只处理 "model" 类型的事件
-					if msgType != "model" {
-						continue
-					}
-
-					sseMsg := SSEMessage{
-						Type: msgType,
-						Raw:  msg,
-					}
-
-					if event, ok := msg["event"].(map[string]interface{}); ok {
-						sseMsg.Event = event
-					}
-
-					onMessage(sseMsg)
+				if !strings.HasPrefix(l, "data: ") {
+					continue
 				}
+				rawData := strings.TrimPrefix(l, "data: ")
+
+				var msg map[string]interface{}
+				if err := json.Unmarshal([]byte(rawData), &msg); err != nil {
+					continue
+				}
+
+				msgType, _ := msg["type"].(string)
+
+				// 记录上游 SSE
+				if logger != nil {
+					logger.LogUpstreamSSE(msgType, rawData)
+				}
+
+				// 非 model 类型打印到日志方便排查
+				if msgType != "model" {
+					log.Printf("[upstream] type=%s data=%s", msgType, rawData)
+					continue
+				}
+
+				sseMsg := SSEMessage{
+					Type: msgType,
+					Raw:  msg,
+				}
+				if event, ok := msg["event"].(map[string]interface{}); ok {
+					sseMsg.Event = event
+				}
+				onMessage(sseMsg)
 			}
 		}
 	}
