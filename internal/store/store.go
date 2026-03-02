@@ -62,7 +62,7 @@ func (s *Store) migrate() error {
 			client_uat TEXT NOT NULL,
 			project_id TEXT NOT NULL,
 			user_id TEXT NOT NULL,
-			agent_mode TEXT DEFAULT 'claude-opus-4.5',
+			agent_mode TEXT DEFAULT 'claude-opus-4.6',
 			email TEXT NOT NULL,
 			weight INTEGER DEFAULT 1,
 			enabled INTEGER DEFAULT 1,

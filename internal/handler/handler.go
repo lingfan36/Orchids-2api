@@ -50,14 +50,20 @@ func NewWithLoadBalancer(cfg *config.Config, lb *loadbalancer.LoadBalancer) *Han
 
 // mapModel 根据请求的 model 名称映射到实际使用的模型
 func mapModel(requestModel string) string {
+	// 精确匹配直接透传
+	switch requestModel {
+	case "gemini-3.1 pro", "claude-opus-4.5", "claude-opus-4.6", "claude-sonnet-4.6":
+		return requestModel
+	}
+	// 模糊兜底匹配
 	lowerModel := strings.ToLower(requestModel)
 	if strings.Contains(lowerModel, "opus") {
-		return "claude-opus-4.5"
+		return "claude-opus-4.6"
 	}
 	if strings.Contains(lowerModel, "haiku") {
-		return "gemini-3-flash"
+		return "gemini-3.1 pro"
 	}
-	return "claude-sonnet-4-5"
+	return "claude-sonnet-4.6"
 }
 
 // fixToolInput 修复工具输入中的类型问题
