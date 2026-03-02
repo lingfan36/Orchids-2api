@@ -196,6 +196,20 @@ func (a *API) HandleImport(w http.ResponseWriter, r *http.Request) {
 	for _, acc := range exportData.Accounts {
 		acc.ID = 0
 		acc.RequestCount = 0
+
+		if acc.ClientCookie != "" && acc.SessionID == "" {
+			info, err := clerk.FetchAccountInfo(acc.ClientCookie)
+			if err == nil {
+				acc.SessionID = info.SessionID
+				acc.ClientUat = info.ClientUat
+				acc.ProjectID = info.ProjectID
+				acc.UserID = info.UserID
+				acc.Email = info.Email
+			} else {
+				log.Printf("Failed to fetch account info for %s: %v", acc.Email, err)
+			}
+		}
+
 		if err := a.store.CreateAccount(&acc); err != nil {
 			log.Printf("Failed to import account %s: %v", acc.Name, err)
 			result.Skipped++
