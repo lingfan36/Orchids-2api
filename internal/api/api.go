@@ -179,6 +179,35 @@ func (a *API) HandleExport(w http.ResponseWriter, r *http.Request) {
 	json.NewEncoder(w).Encode(exportData)
 }
 
+func (a *API) HandleDebugFetchSession(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+
+	var body struct {
+		Cookie string `json:"cookie"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+		http.Error(w, "Invalid JSON: "+err.Error(), http.StatusBadRequest)
+		return
+	}
+
+	if body.Cookie == "" {
+		http.Error(w, "cookie field is required", http.StatusBadRequest)
+		return
+	}
+
+	info, err := clerk.FetchAccountInfo(body.Cookie)
+	w.Header().Set("Content-Type", "application/json")
+	if err != nil {
+		w.WriteHeader(http.StatusBadGateway)
+		json.NewEncoder(w).Encode(map[string]string{"error": err.Error()})
+		return
+	}
+	json.NewEncoder(w).Encode(info)
+}
+
 func (a *API) HandleImport(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost {
 		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
@@ -205,9 +234,18 @@ func (a *API) HandleImport(w http.ResponseWriter, r *http.Request) {
 				acc.ProjectID = info.ProjectID
 				acc.UserID = info.UserID
 				acc.Email = info.Email
+				log.Printf("Successfully fetched session for %s: session_id=%s", acc.Email, info.SessionID)
 			} else {
 				log.Printf("Failed to fetch account info for %s: %v", acc.Email, err)
+				result.Skipped++
+				continue
 			}
+		}
+
+		if acc.SessionID == "" {
+			log.Printf("Skipping account %s: session_id is empty and no cookie to fetch from", acc.Name)
+			result.Skipped++
+			continue
 		}
 
 		if err := a.store.CreateAccount(&acc); err != nil {

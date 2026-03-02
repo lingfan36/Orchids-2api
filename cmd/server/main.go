@@ -74,6 +74,7 @@ func main() {
 	mux.HandleFunc("/api/accounts/", middleware.BasicAuth(cfg.AdminUser, cfg.AdminPass, apiHandler.HandleAccountByID))
 	mux.HandleFunc("/api/export", middleware.BasicAuth(cfg.AdminUser, cfg.AdminPass, apiHandler.HandleExport))
 	mux.HandleFunc("/api/import", middleware.BasicAuth(cfg.AdminUser, cfg.AdminPass, apiHandler.HandleImport))
+	mux.HandleFunc("/api/debug/fetch-session", middleware.BasicAuth(cfg.AdminUser, cfg.AdminPass, apiHandler.HandleDebugFetchSession))
 
 	mux.HandleFunc(cfg.AdminPath+"/", middleware.BasicAuthHandler(cfg.AdminUser, cfg.AdminPass, http.StripPrefix(cfg.AdminPath, web.StaticHandler())))
 
