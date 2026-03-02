@@ -39,9 +39,10 @@ Thumbs.db
 .env.local
 .env.*.local
 
-# Database
+# Database (contains sensitive account data, never commit)
 *.db
 *.sqlite
+data/
 
 # Logs
 *.log
