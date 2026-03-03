@@ -28,7 +28,7 @@ func Load() *Config {
 		ClientUat:    getEnv("CLIENT_UAT", "1768272707"),
 		ProjectID:    getEnv("PROJECT_ID", "280b7bae-cd29-41e4-a0a6-7f603c43b607"),
 		UserID:       getEnv("USER_ID", "user_38BUxvjgpzOuZwztspEW9ZYroXs"),
-		AgentMode:    getEnv("AGENT_MODE", "claude-opus-4.5"),
+		AgentMode:    getEnv("AGENT_MODE", "claude-opus-4.6"),
 		Email:        getEnv("EMAIL", "crushla4@swsdz.com"),
 		AdminUser:    getEnv("ADMIN_USER", "admin"),
 		AdminPass:    getEnv("ADMIN_PASS", "admin123"),

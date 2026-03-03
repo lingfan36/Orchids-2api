@@ -54,3 +54,7 @@ dist/
 
 # Test
 test/
+
+# Temp scripts
+*.js
+*.ps1

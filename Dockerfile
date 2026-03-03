@@ -18,11 +18,8 @@ WORKDIR /app
 RUN apk add --no-cache ca-certificates
 
 COPY --from=builder /app/server .
-COPY --from=builder /app/web ./web
 
-COPY --from=builder /app/data ./data
-
-RUN mkdir -p /app/debug
+RUN mkdir -p /app/data /app/debug
 
 EXPOSE 3002
 

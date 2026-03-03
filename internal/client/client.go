@@ -2,14 +2,18 @@ package client
 
 import (
 	"bufio"
-	"bytes"
 	"context"
+	cryptorand "crypto/rand"
+	"crypto/sha1"
+	"encoding/base64"
+	"encoding/binary"
 	"encoding/json"
 	"fmt"
 	"io"
 	"log"
-	"math/rand/v2"
+	"net"
 	"net/http"
+	"net/url"
 	"strings"
 	"time"
 
@@ -18,32 +22,32 @@ import (
 	"orchids-api/internal/store"
 )
 
-const upstreamURL = "https://orchids-server.calmstone-6964e08a.westeurope.azurecontainerapps.io/agent/coding-agent"
+const (
+	wsBaseURL  = "wss://orchids-server.calmstone-6964e08a.westeurope.azurecontainerapps.io/agent/ws/coding"
+	apiVersion = "5"
+)
 
 type Client struct {
-	config     *config.Config
-	account    *store.Account
-	store      *store.Store
-	httpClient *http.Client
-}
-
-type TokenResponse struct {
-	JWT string `json:"jwt"`
+	config  *config.Config
+	account *store.Account
+	store   *store.Store
 }
 
 type AgentRequest struct {
-	Prompt        string        `json:"prompt"`
-	ChatHistory   []interface{} `json:"chatHistory"`
-	ProjectID     string        `json:"projectId"`
-	CurrentPage   interface{}   `json:"currentPage"`
-	AgentMode     string        `json:"agentMode"`
-	Mode          string        `json:"mode"`
-	GitRepoUrl    string        `json:"gitRepoUrl"`
-	Email         string        `json:"email"`
-	ChatSessionID int           `json:"chatSessionId"`
-	UserID        string        `json:"userId"`
-	APIVersion    int           `json:"apiVersion"`
-	Model         string        `json:"model,omitempty"`
+	ProjectID             string        `json:"projectId"`
+	Prompt                string        `json:"prompt"`
+	AgentMode             string        `json:"agentMode"`
+	Mode                  string        `json:"mode"`
+	ChatHistory           []interface{} `json:"chatHistory"`
+	ChatSessionID         string        `json:"chatSessionId,omitempty"`
+	AttachmentUrls        []string      `json:"attachmentUrls,omitempty"`
+	FilesInSession        []string      `json:"filesInSession,omitempty"`
+	CurrentPage           interface{}   `json:"currentPage,omitempty"`
+	Email                 string        `json:"email,omitempty"`
+	IsLocal               bool          `json:"isLocal"`
+	LocalWorkingDirectory string        `json:"localWorkingDirectory,omitempty"`
+	UserID                string        `json:"userId,omitempty"`
+	TemplateID            string        `json:"templateId,omitempty"`
 }
 
 type SSEMessage struct {
@@ -52,10 +56,16 @@ type SSEMessage struct {
 	Raw   map[string]interface{} `json:"-"`
 }
 
+// wsFrame is the WebSocket protocol message sent to upstream
+type wsFrame struct {
+	Type      string      `json:"type"`
+	Data      interface{} `json:"data"`
+	RequestID string      `json:"requestId"`
+}
+
 func New(cfg *config.Config) *Client {
 	return &Client{
-		config:     cfg,
-		httpClient: &http.Client{},
+		config: cfg,
 	}
 }
 
@@ -70,15 +80,13 @@ func NewFromAccount(acc *store.Account, s *store.Store) *Client {
 		Email:        acc.Email,
 	}
 	return &Client{
-		config:     cfg,
-		account:    acc,
-		store:      s,
-		httpClient: &http.Client{},
+		config:  cfg,
+		account: acc,
+		store:   s,
 	}
 }
 
-// refreshAndGetToken 通过 client_cookie 从 clerk 获取最新的 session、更新 rotating token，
-// 并直接从响应里取出 JWT，避免二次请求。
+// refreshAndGetToken 通过 client_cookie 从 clerk 获取最新的 JWT
 func (c *Client) refreshAndGetToken() (string, error) {
 	clerkURL := "https://clerk.orchids.app/v1/client?__clerk_api_version=2025-11-10&_clerk_js_version=5.117.0"
 
@@ -92,20 +100,19 @@ func (c *Client) refreshAndGetToken() (string, error) {
 	req.Header.Set("Accept-Language", "zh-CN")
 	req.Header.Set("Cookie", "__client="+c.config.ClientCookie+"; __client_uat="+c.config.ClientUat)
 
-	httpClient := &http.Client{Timeout: 10 * time.Second}
+	httpClient := &http.Client{Timeout: 15 * time.Second}
 	resp, err := httpClient.Do(req)
 	if err != nil {
 		return "", fmt.Errorf("failed to call clerk: %w", err)
 	}
 	defer resp.Body.Close()
 
-	// 先把 body 读出来，防止多次读取
 	bodyBytes, err := io.ReadAll(resp.Body)
 	if err != nil {
 		return "", fmt.Errorf("failed to read clerk response: %w", err)
 	}
 
-	// 从 Set-Cookie 更新 rotating __client token 和 __client_uat
+	// 从 Set-Cookie 更新 rotating __client token
 	for _, cookie := range resp.Cookies() {
 		switch cookie.Name {
 		case "__client":
@@ -149,7 +156,6 @@ func (c *Client) refreshAndGetToken() (string, error) {
 		return "", fmt.Errorf("no active sessions found. body: %s", string(bodyBytes))
 	}
 
-	// 找到 last_active_session 对应的 session，优先取它的 JWT
 	targetSessionID := clientResp.Response.LastActiveSessionID
 	var jwt string
 	for _, s := range clientResp.Response.Sessions {
@@ -160,7 +166,6 @@ func (c *Client) refreshAndGetToken() (string, error) {
 		}
 	}
 	if jwt == "" {
-		// fallback: 取第一个 session 的 JWT
 		jwt = clientResp.Response.Sessions[0].LastActiveToken.JWT
 		targetSessionID = clientResp.Response.Sessions[0].ID
 	}
@@ -170,7 +175,6 @@ func (c *Client) refreshAndGetToken() (string, error) {
 
 	log.Printf("成功获取 JWT for %s (session: %s)", c.config.Email, targetSessionID)
 
-	// 持久化最新 session_id
 	if targetSessionID != c.config.SessionID {
 		c.config.SessionID = targetSessionID
 		if c.account != nil && c.account.ID > 0 && c.store != nil {
@@ -187,67 +191,270 @@ func (c *Client) GetToken() (string, error) {
 	return c.refreshAndGetToken()
 }
 
-func (c *Client) SendRequest(ctx context.Context, prompt string, chatHistory []interface{}, model string, onMessage func(SSEMessage), logger *debug.Logger) error {
+// wsConnect 建立 WebSocket 连接（纯标准库，无外部依赖）
+func wsConnect(wsURL string) (net.Conn, *bufio.Reader, error) {
+	u, err := url.Parse(wsURL)
+	if err != nil {
+		return nil, nil, fmt.Errorf("parse ws url: %w", err)
+	}
+
+	host := u.Host
+	if !strings.Contains(host, ":") {
+		if u.Scheme == "wss" {
+			host += ":443"
+		} else {
+			host += ":80"
+		}
+	}
+
+	// TLS for wss://
+	var conn net.Conn
+	if u.Scheme == "wss" {
+		conn, err = tlsDial(host, u.Hostname())
+		if err != nil {
+			return nil, nil, fmt.Errorf("tls dial %s: %w", host, err)
+		}
+	} else {
+		conn, err = net.DialTimeout("tcp", host, 15*time.Second)
+		if err != nil {
+			return nil, nil, fmt.Errorf("tcp dial %s: %w", host, err)
+		}
+	}
+
+	// Generate random WebSocket key
+	keyBytes := make([]byte, 16)
+	if _, err := cryptorand.Read(keyBytes); err != nil {
+		conn.Close()
+		return nil, nil, fmt.Errorf("generate ws key: %w", err)
+	}
+	key := base64.StdEncoding.EncodeToString(keyBytes)
+
+	// WebSocket HTTP/1.1 upgrade handshake
+	path := u.RequestURI()
+	handshake := "GET " + path + " HTTP/1.1\r\n" +
+		"Host: " + u.Hostname() + "\r\n" +
+		"Upgrade: websocket\r\n" +
+		"Connection: Upgrade\r\n" +
+		"Sec-WebSocket-Key: " + key + "\r\n" +
+		"Sec-WebSocket-Version: 13\r\n" +
+		"Origin: https://orchids.app\r\n" +
+		"User-Agent: Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Orchids/0.0.57 Chrome/138.0.7204.251 Electron/37.10.3 Safari/537.36\r\n" +
+		"\r\n"
+
+	if err := conn.SetDeadline(time.Now().Add(15 * time.Second)); err != nil {
+		conn.Close()
+		return nil, nil, err
+	}
+	if _, err := conn.Write([]byte(handshake)); err != nil {
+		conn.Close()
+		return nil, nil, fmt.Errorf("ws handshake write: %w", err)
+	}
+
+	reader := bufio.NewReaderSize(conn, 65536)
+	statusLine, err := reader.ReadString('\n')
+	if err != nil {
+		conn.Close()
+		return nil, nil, fmt.Errorf("ws handshake read status: %w", err)
+	}
+	if !strings.Contains(statusLine, "101") {
+		var sb strings.Builder
+		sb.WriteString(statusLine)
+		for {
+			line, readErr := reader.ReadString('\n')
+			sb.WriteString(line)
+			if readErr != nil || strings.TrimSpace(line) == "" {
+				break
+			}
+		}
+		conn.Close()
+		return nil, nil, fmt.Errorf("ws upgrade failed: %s", sb.String())
+	}
+
+	// Verify Sec-WebSocket-Accept and drain remaining headers
+	expectedAccept := computeAcceptKey(key)
+	var gotAccept string
+	for {
+		line, readErr := reader.ReadString('\n')
+		if readErr != nil || strings.TrimSpace(line) == "" {
+			break
+		}
+		if strings.HasPrefix(strings.ToLower(line), "sec-websocket-accept:") {
+			gotAccept = strings.TrimSpace(strings.SplitN(line, ":", 2)[1])
+		}
+	}
+	if gotAccept != "" && gotAccept != expectedAccept {
+		conn.Close()
+		return nil, nil, fmt.Errorf("ws accept key mismatch: got %s, want %s", gotAccept, expectedAccept)
+	}
+
+	// Clear deadline for subsequent reads/writes
+	if err := conn.SetDeadline(time.Time{}); err != nil {
+		conn.Close()
+		return nil, nil, err
+	}
+	return conn, reader, nil
+}
+
+func computeAcceptKey(key string) string {
+	h := sha1.New()
+	h.Write([]byte(key + "258EAFA5-E914-47DA-95CA-C5AB0DC85B11"))
+	return base64.StdEncoding.EncodeToString(h.Sum(nil))
+}
+
+// wsSendText sends a masked text frame (masking is required client→server per RFC 6455)
+func wsSendText(conn net.Conn, data []byte) error {
+	mask := make([]byte, 4)
+	if _, err := cryptorand.Read(mask); err != nil {
+		return fmt.Errorf("generate mask: %w", err)
+	}
+
+	masked := make([]byte, len(data))
+	for i, b := range data {
+		masked[i] = b ^ mask[i%4]
+	}
+
+	var frame []byte
+	frame = append(frame, 0x81) // FIN=1, opcode=1 (text)
+
+	n := len(masked)
+	switch {
+	case n <= 125:
+		frame = append(frame, byte(0x80|n))
+	case n <= 65535:
+		frame = append(frame, 0x80|126)
+		frame = append(frame, byte(n>>8), byte(n))
+	default:
+		frame = append(frame, 0x80|127)
+		b := make([]byte, 8)
+		binary.BigEndian.PutUint64(b, uint64(n))
+		frame = append(frame, b...)
+	}
+
+	frame = append(frame, mask...)
+	frame = append(frame, masked...)
+
+	if err := conn.SetDeadline(time.Now().Add(10 * time.Second)); err != nil {
+		return err
+	}
+	defer conn.SetDeadline(time.Time{})
+	_, err := conn.Write(frame)
+	return err
+}
+
+// wsReadFrame reads one WebSocket frame; returns (opcode, payload, err)
+func wsReadFrame(reader *bufio.Reader) (byte, []byte, error) {
+	b0, err := reader.ReadByte()
+	if err != nil {
+		return 0, nil, err
+	}
+	b1, err := reader.ReadByte()
+	if err != nil {
+		return 0, nil, err
+	}
+
+	opcode := b0 & 0x0F
+	isMasked := (b1 & 0x80) != 0
+	payloadLen := int64(b1 & 0x7F)
+
+	switch payloadLen {
+	case 126:
+		var l uint16
+		if err := binary.Read(reader, binary.BigEndian, &l); err != nil {
+			return 0, nil, err
+		}
+		payloadLen = int64(l)
+	case 127:
+		if err := binary.Read(reader, binary.BigEndian, &payloadLen); err != nil {
+			return 0, nil, err
+		}
+	}
+
+	var maskBytes [4]byte
+	if isMasked {
+		if _, err := io.ReadFull(reader, maskBytes[:]); err != nil {
+			return 0, nil, err
+		}
+	}
+
+	payload := make([]byte, payloadLen)
+	if _, err := io.ReadFull(reader, payload); err != nil {
+		return 0, nil, err
+	}
+
+	if isMasked {
+		for i := range payload {
+			payload[i] ^= maskBytes[i%4]
+		}
+	}
+
+	return opcode, payload, nil
+}
+
+// newRequestID generates a UUID v4
+func newRequestID() string {
+	b := make([]byte, 16)
+	cryptorand.Read(b)
+	b[6] = (b[6] & 0x0f) | 0x40
+	b[8] = (b[8] & 0x3f) | 0x80
+	return fmt.Sprintf("%x-%x-%x-%x-%x", b[0:4], b[4:6], b[6:8], b[8:10], b[10:])
+}
+
+func (c *Client) SendRequest(ctx context.Context, promptText string, chatHistory []interface{}, model string, onMessage func(SSEMessage), logger *debug.Logger) error {
 	token, err := c.GetToken()
 	if err != nil {
 		return fmt.Errorf("failed to get token: %w", err)
 	}
 
-	payload := AgentRequest{
-		Prompt:        prompt,
-		ChatHistory:   chatHistory,
+	wsURL := wsBaseURL + "?token=" + url.QueryEscape(token) + "&orchids_api_version=" + apiVersion
+	log.Printf("连接 WebSocket: %s", wsBaseURL)
+
+	conn, reader, err := wsConnect(wsURL)
+	if err != nil {
+		return fmt.Errorf("ws connect failed: %w", err)
+	}
+	defer conn.Close()
+
+	chatSessionID := newRequestID()
+	// agentMode 是模型选择器（如 "claude-opus-4.6"），优先使用传入的 model 参数
+	agentMode := model
+	if agentMode == "" {
+		agentMode = c.config.AgentMode
+	}
+
+	data := AgentRequest{
 		ProjectID:     c.config.ProjectID,
-		CurrentPage:   map[string]interface{}{},
-		AgentMode:     c.config.AgentMode,
+		Prompt:        promptText,
+		AgentMode:     agentMode,
 		Mode:          "agent",
-		GitRepoUrl:    "",
+		ChatHistory:   chatHistory,
+		ChatSessionID: chatSessionID,
 		Email:         c.config.Email,
-		ChatSessionID: rand.IntN(90000000) + 10000000,
+		IsLocal:       false,
 		UserID:        c.config.UserID,
-		APIVersion:    2,
-		Model:         model,
 	}
 
-	body, err := json.Marshal(payload)
+	requestID := newRequestID()
+	msg := wsFrame{
+		Type:      "user_request",
+		Data:      data,
+		RequestID: requestID,
+	}
+
+	msgBytes, err := json.Marshal(msg)
 	if err != nil {
-		return err
+		return fmt.Errorf("marshal ws frame: %w", err)
 	}
 
-	req, err := http.NewRequestWithContext(ctx, "POST", upstreamURL, bytes.NewReader(body))
-	if err != nil {
-		return err
-	}
-
-	req.Header.Set("Accept", "text/event-stream")
-	req.Header.Set("Authorization", "Bearer "+token)
-	req.Header.Set("Content-Type", "application/json")
-	req.Header.Set("X-Orchids-Api-Version", "2")
-
-	// 记录上游请求
 	if logger != nil {
-		headers := map[string]string{
-			"Accept":              "text/event-stream",
-			"Authorization":       "Bearer [REDACTED]",
-			"Content-Type":        "application/json",
-			"X-Orchids-Api-Version": "2",
-		}
-		logger.LogUpstreamRequest(upstreamURL, headers, payload)
+		logger.LogUpstreamRequest(wsBaseURL, map[string]string{"type": "websocket"}, msg)
 	}
 
-	resp, err := c.httpClient.Do(req)
-	if err != nil {
-		return err
+	if err := wsSendText(conn, msgBytes); err != nil {
+		return fmt.Errorf("ws send failed: %w", err)
 	}
-	defer resp.Body.Close()
+	log.Printf("已发送 user_request (requestId=%s)", requestID)
 
-	if resp.StatusCode != http.StatusOK {
-		body, _ := io.ReadAll(resp.Body)
-		return fmt.Errorf("upstream request failed with status %d: %s", resp.StatusCode, string(body))
-	}
-
-	reader := bufio.NewReader(resp.Body)
-	var buffer strings.Builder
-
+	// Read loop
 	for {
 		select {
 		case <-ctx.Done():
@@ -255,56 +462,89 @@ func (c *Client) SendRequest(ctx context.Context, prompt string, chatHistory []i
 		default:
 		}
 
-		line, err := reader.ReadString('\n')
-		if err != nil {
-			if err == io.EOF {
-				break
-			}
+		if err := conn.SetDeadline(time.Now().Add(120 * time.Second)); err != nil {
 			return err
 		}
+		opcode, frameData, err := wsReadFrame(reader)
+		conn.SetDeadline(time.Time{})
 
-		buffer.WriteString(line)
-
-		if line == "\n" {
-			eventData := buffer.String()
-			buffer.Reset()
-
-			lines := strings.Split(eventData, "\n")
-			for _, l := range lines {
-				if !strings.HasPrefix(l, "data: ") {
-					continue
-				}
-				rawData := strings.TrimPrefix(l, "data: ")
-
-				var msg map[string]interface{}
-				if err := json.Unmarshal([]byte(rawData), &msg); err != nil {
-					continue
-				}
-
-				msgType, _ := msg["type"].(string)
-
-				// 记录上游 SSE
-				if logger != nil {
-					logger.LogUpstreamSSE(msgType, rawData)
-				}
-
-				// 非 model 类型打印到日志方便排查
-				if msgType != "model" {
-					log.Printf("[upstream] type=%s data=%s", msgType, rawData)
-					continue
-				}
-
-				sseMsg := SSEMessage{
-					Type: msgType,
-					Raw:  msg,
-				}
-				if event, ok := msg["event"].(map[string]interface{}); ok {
-					sseMsg.Event = event
-				}
-				onMessage(sseMsg)
+		if err != nil {
+			if ctx.Err() != nil {
+				return ctx.Err()
 			}
+			return fmt.Errorf("ws read: %w", err)
+		}
+
+		switch opcode {
+		case 0x8: // close
+			log.Printf("WebSocket close frame received")
+			return nil
+		case 0x9: // ping → pong
+			pongFrame := []byte{0x8A, 0x80, 0x00, 0x00, 0x00, 0x00}
+			conn.Write(pongFrame)
+			continue
+		case 0xA: // pong
+			continue
+		case 0x0, 0x1, 0x2: // continuation, text, binary
+			// fall through to parse
+		default:
+			continue
+		}
+
+		var raw map[string]interface{}
+		if err := json.Unmarshal(frameData, &raw); err != nil {
+			log.Printf("ws frame JSON parse error: %v, raw: %.200s", err, string(frameData))
+			continue
+		}
+
+		msgType, _ := raw["type"].(string)
+
+		if logger != nil {
+			logger.LogUpstreamSSE(msgType, string(frameData))
+		}
+		log.Printf("[upstream ws] type=%s", msgType)
+
+		switch msgType {
+		case "complete":
+			return nil
+
+		case "error", "coding_agent.error":
+			if d, ok := raw["data"].(map[string]interface{}); ok {
+				if e, ok := d["error"].(string); ok {
+					return fmt.Errorf("upstream error: %s", e)
+				}
+				if e, ok := d["message"].(string); ok {
+					return fmt.Errorf("upstream error: %s", e)
+				}
+			}
+			return fmt.Errorf("upstream error: %.500s", string(frameData))
+
+		case "request_ack":
+			log.Printf("request_ack received for %s", requestID)
+			continue
+
+		case "heartbeat":
+			continue
+
+		case "model":
+			sseMsg := SSEMessage{
+				Type: msgType,
+				Raw:  raw,
+			}
+			if event, ok := raw["event"].(map[string]interface{}); ok {
+				sseMsg.Event = event
+			} else if eventData, ok := raw["data"].(map[string]interface{}); ok {
+				sseMsg.Event = eventData
+			}
+			onMessage(sseMsg)
+
+		default:
+			// forward unknown event types so handler can decide
+			sseMsg := SSEMessage{Type: msgType, Raw: raw}
+			if event, ok := raw["event"].(map[string]interface{}); ok {
+				sseMsg.Event = event
+			}
+			onMessage(sseMsg)
 		}
 	}
-
-	return nil
 }

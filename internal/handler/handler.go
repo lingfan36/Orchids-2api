@@ -50,11 +50,11 @@ func NewWithLoadBalancer(cfg *config.Config, lb *loadbalancer.LoadBalancer, s *s
 	}
 }
 
-// mapModel 根据请求的 model 名称映射到实际使用的模型
+// mapModel 根据请求的 model 名称映射到 Orchids 支持的模型 agentMode 值
 func mapModel(requestModel string) string {
 	// 精确匹配直接透传
 	switch requestModel {
-	case "gemini-3.1 pro", "claude-opus-4.5", "claude-opus-4.6", "claude-sonnet-4.6":
+	case "claude-opus-4.6", "claude-sonnet-4-6", "auto":
 		return requestModel
 	}
 	// 模糊兜底匹配
@@ -62,10 +62,12 @@ func mapModel(requestModel string) string {
 	if strings.Contains(lowerModel, "opus") {
 		return "claude-opus-4.6"
 	}
-	if strings.Contains(lowerModel, "haiku") {
-		return "gemini-3.1 pro"
+	// haiku/haiku-like → sonnet (Orchids 最快模型)
+	if strings.Contains(lowerModel, "haiku") || strings.Contains(lowerModel, "flash") {
+		return "claude-sonnet-4-6"
 	}
-	return "claude-sonnet-4.6"
+	// 默认 sonnet
+	return "claude-sonnet-4-6"
 }
 
 // fixToolInput 修复工具输入中的类型问题
