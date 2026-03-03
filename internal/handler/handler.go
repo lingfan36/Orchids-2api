@@ -24,6 +24,7 @@ type Handler struct {
 	config       *config.Config
 	client       *client.Client
 	loadBalancer *loadbalancer.LoadBalancer
+	store        *store.Store
 }
 
 type ClaudeRequest struct {
@@ -41,10 +42,11 @@ func New(cfg *config.Config) *Handler {
 	}
 }
 
-func NewWithLoadBalancer(cfg *config.Config, lb *loadbalancer.LoadBalancer) *Handler {
+func NewWithLoadBalancer(cfg *config.Config, lb *loadbalancer.LoadBalancer, s *store.Store) *Handler {
 	return &Handler{
 		config:       cfg,
 		loadBalancer: lb,
+		store:        s,
 	}
 }
 
@@ -165,7 +167,7 @@ func (h *Handler) HandleMessages(w http.ResponseWriter, r *http.Request) {
 				return err
 			}
 			log.Printf("使用账号: %s (%s)", account.Name, account.Email)
-			apiClient = client.NewFromAccount(account)
+			apiClient = client.NewFromAccount(account, h.store)
 			currentAccount = account
 			return nil
 		} else if h.client != nil {

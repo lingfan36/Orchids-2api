@@ -59,15 +59,22 @@ func (a *API) HandleAccounts(w http.ResponseWriter, r *http.Request) {
 		if acc.ClientCookie != "" && acc.SessionID == "" {
 			info, err := clerk.FetchAccountInfo(acc.ClientCookie)
 			if err != nil {
-				log.Printf("Failed to fetch account info: %v", err)
-				http.Error(w, "Failed to fetch account info: "+err.Error(), http.StatusBadRequest)
-				return
+				// session 获取失败时使用占位符，请求时会通过 client_cookie 自动刷新
+				log.Printf("Failed to fetch account info: %v，将在首次请求时自动刷新", err)
+				acc.SessionID = "pending_refresh"
+				if acc.ClientUat == "" {
+					acc.ClientUat = "0"
+				}
+				if acc.ProjectID == "" {
+					acc.ProjectID = "280b7bae-cd29-41e4-a0a6-7f603c43b607"
+				}
+			} else {
+				acc.SessionID = info.SessionID
+				acc.ClientUat = info.ClientUat
+				acc.ProjectID = info.ProjectID
+				acc.UserID = info.UserID
+				acc.Email = info.Email
 			}
-			acc.SessionID = info.SessionID
-			acc.ClientUat = info.ClientUat
-			acc.ProjectID = info.ProjectID
-			acc.UserID = info.UserID
-			acc.Email = info.Email
 		}
 
 		if err := a.store.CreateAccount(&acc); err != nil {
@@ -236,14 +243,20 @@ func (a *API) HandleImport(w http.ResponseWriter, r *http.Request) {
 				acc.Email = info.Email
 				log.Printf("Successfully fetched session for %s: session_id=%s", acc.Email, info.SessionID)
 			} else {
-				log.Printf("Failed to fetch account info for %s: %v", acc.Email, err)
-				result.Skipped++
-				continue
+				// session 获取失败时使用占位符，请求时会通过 client_cookie 自动刷新
+				log.Printf("Failed to fetch session for %s: %v，将在首次请求时自动刷新", acc.Email, err)
+				acc.SessionID = "pending_refresh"
+				if acc.ClientUat == "" {
+					acc.ClientUat = "0"
+				}
+				if acc.ProjectID == "" {
+					acc.ProjectID = "280b7bae-cd29-41e4-a0a6-7f603c43b607"
+				}
 			}
 		}
 
-		if acc.SessionID == "" {
-			log.Printf("Skipping account %s: session_id is empty and no cookie to fetch from", acc.Name)
+		if acc.ClientCookie == "" && acc.SessionID == "" {
+			log.Printf("Skipping account %s: both client_cookie and session_id are empty", acc.Name)
 			result.Skipped++
 			continue
 		}

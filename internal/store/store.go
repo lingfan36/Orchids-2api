@@ -220,6 +220,16 @@ func (s *Store) GetEnabledAccounts() ([]*Account, error) {
 	return accounts, nil
 }
 
+func (s *Store) UpdateSessionID(id int64, sessionID string) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	_, err := s.db.Exec(`
+		UPDATE accounts SET session_id = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?
+	`, sessionID, id)
+	return err
+}
+
 func (s *Store) IncrementRequestCount(id int64) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()

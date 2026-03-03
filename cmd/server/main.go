@@ -64,7 +64,7 @@ func main() {
 
 	lb := loadbalancer.New(s)
 	apiHandler := api.New(s)
-	h := handler.NewWithLoadBalancer(cfg, lb)
+	h := handler.NewWithLoadBalancer(cfg, lb, s)
 
 	mux := http.NewServeMux()
 
