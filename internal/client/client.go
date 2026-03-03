@@ -77,18 +77,18 @@ func NewFromAccount(acc *store.Account, s *store.Store) *Client {
 	}
 }
 
-// refreshSessionID 通过 client_cookie 从 clerk 获取最新的 session_id
+// refreshSessionID 通过 client_cookie 从 clerk 获取最新的 session_id 和 client_uat
 func (c *Client) refreshSessionID() error {
-	url := "https://clerk.orchids.app/v1/client?__clerk_api_version=2025-11-10&_clerk_js_version=5.117.0"
+	clerkURL := "https://clerk.orchids.app/v1/client?__clerk_api_version=2025-11-10&_clerk_js_version=5.117.0"
 
-	req, err := http.NewRequest("GET", url, nil)
+	req, err := http.NewRequest("GET", clerkURL, nil)
 	if err != nil {
 		return fmt.Errorf("failed to create refresh request: %w", err)
 	}
 
 	req.Header.Set("User-Agent", "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Orchids/0.0.57 Chrome/138.0.7204.251 Electron/37.10.3 Safari/537.36")
 	req.Header.Set("Accept-Language", "zh-CN")
-	req.AddCookie(&http.Cookie{Name: "__client", Value: c.config.ClientCookie})
+	req.Header.Set("Cookie", "__client="+c.config.ClientCookie)
 
 	httpClient := &http.Client{Timeout: 10 * time.Second}
 	resp, err := httpClient.Do(req)
@@ -96,6 +96,26 @@ func (c *Client) refreshSessionID() error {
 		return fmt.Errorf("failed to refresh session: %w", err)
 	}
 	defer resp.Body.Close()
+
+	// 从响应 Set-Cookie 里更新 __client 和 __client_uat
+	for _, cookie := range resp.Cookies() {
+		switch cookie.Name {
+		case "__client":
+			if cookie.Value != "" && cookie.Value != c.config.ClientCookie {
+				log.Printf("client_cookie 已更新")
+				c.config.ClientCookie = cookie.Value
+				if c.account != nil && c.account.ID > 0 {
+					if err := c.store.UpdateClientCookie(c.account.ID, cookie.Value); err != nil {
+						log.Printf("警告: 更新数据库 client_cookie 失败: %v", err)
+					}
+				}
+			}
+		case "__client_uat":
+			if cookie.Value != "" {
+				c.config.ClientUat = cookie.Value
+			}
+		}
+	}
 
 	if resp.StatusCode != http.StatusOK {
 		body, _ := io.ReadAll(resp.Body)
@@ -111,6 +131,9 @@ func (c *Client) refreshSessionID() error {
 				User   struct {
 					ID string `json:"id"`
 				} `json:"user"`
+				LastActiveToken struct {
+					JWT string `json:"jwt"`
+				} `json:"last_active_token"`
 			} `json:"sessions"`
 		} `json:"response"`
 	}
@@ -128,10 +151,10 @@ func (c *Client) refreshSessionID() error {
 		newSessionID = clientResp.Response.Sessions[0].ID
 	}
 
+	log.Printf("Successfully fetched session for %s: session_id=%s", c.config.Email, newSessionID)
+
 	if newSessionID != c.config.SessionID {
-		log.Printf("session 已刷新: %s -> %s", c.config.SessionID, newSessionID)
 		c.config.SessionID = newSessionID
-		// 持久化到数据库，避免下次重建 Client 时又读到旧 session_id
 		if c.account != nil && c.account.ID > 0 {
 			if err := c.store.UpdateSessionID(c.account.ID, newSessionID); err != nil {
 				log.Printf("警告: 更新数据库 session_id 失败: %v", err)

@@ -230,6 +230,16 @@ func (s *Store) UpdateSessionID(id int64, sessionID string) error {
 	return err
 }
 
+func (s *Store) UpdateClientCookie(id int64, clientCookie string) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	_, err := s.db.Exec(`
+		UPDATE accounts SET client_cookie = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?
+	`, clientCookie, id)
+	return err
+}
+
 func (s *Store) IncrementRequestCount(id int64) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
