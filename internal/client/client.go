@@ -77,36 +77,43 @@ func NewFromAccount(acc *store.Account, s *store.Store) *Client {
 	}
 }
 
-// refreshSessionID 通过 client_cookie 从 clerk 获取最新的 session_id 和 client_uat
-func (c *Client) refreshSessionID() error {
+// refreshAndGetToken 通过 client_cookie 从 clerk 获取最新的 session、更新 rotating token，
+// 并直接从响应里取出 JWT，避免二次请求。
+func (c *Client) refreshAndGetToken() (string, error) {
 	clerkURL := "https://clerk.orchids.app/v1/client?__clerk_api_version=2025-11-10&_clerk_js_version=5.117.0"
 
 	req, err := http.NewRequest("GET", clerkURL, nil)
 	if err != nil {
-		return fmt.Errorf("failed to create refresh request: %w", err)
+		return "", fmt.Errorf("failed to create clerk request: %w", err)
 	}
 
 	req.Header.Set("User-Agent", "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Orchids/0.0.57 Chrome/138.0.7204.251 Electron/37.10.3 Safari/537.36")
+	req.Header.Set("Accept", "application/json")
 	req.Header.Set("Accept-Language", "zh-CN")
-	req.Header.Set("Cookie", "__client="+c.config.ClientCookie)
+	req.Header.Set("Cookie", "__client="+c.config.ClientCookie+"; __client_uat="+c.config.ClientUat)
 
 	httpClient := &http.Client{Timeout: 10 * time.Second}
 	resp, err := httpClient.Do(req)
 	if err != nil {
-		return fmt.Errorf("failed to refresh session: %w", err)
+		return "", fmt.Errorf("failed to call clerk: %w", err)
 	}
 	defer resp.Body.Close()
 
-	// 从响应 Set-Cookie 里更新 __client 和 __client_uat
+	// 先把 body 读出来，防止多次读取
+	bodyBytes, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return "", fmt.Errorf("failed to read clerk response: %w", err)
+	}
+
+	// 从 Set-Cookie 更新 rotating __client token 和 __client_uat
 	for _, cookie := range resp.Cookies() {
 		switch cookie.Name {
 		case "__client":
-			if cookie.Value != "" && cookie.Value != c.config.ClientCookie {
-				log.Printf("client_cookie 已更新")
+			if cookie.Value != "" {
 				c.config.ClientCookie = cookie.Value
-				if c.account != nil && c.account.ID > 0 {
-					if err := c.store.UpdateClientCookie(c.account.ID, cookie.Value); err != nil {
-						log.Printf("警告: 更新数据库 client_cookie 失败: %v", err)
+				if c.account != nil && c.account.ID > 0 && c.store != nil {
+					if dbErr := c.store.UpdateClientCookie(c.account.ID, cookie.Value); dbErr != nil {
+						log.Printf("警告: 更新数据库 client_cookie 失败: %v", dbErr)
 					}
 				}
 			}
@@ -118,8 +125,7 @@ func (c *Client) refreshSessionID() error {
 	}
 
 	if resp.StatusCode != http.StatusOK {
-		body, _ := io.ReadAll(resp.Body)
-		return fmt.Errorf("refresh session failed with status %d: %s", resp.StatusCode, string(body))
+		return "", fmt.Errorf("clerk returned status %d: %s", resp.StatusCode, string(bodyBytes))
 	}
 
 	var clientResp struct {
@@ -128,9 +134,6 @@ func (c *Client) refreshSessionID() error {
 			Sessions            []struct {
 				ID     string `json:"id"`
 				Status string `json:"status"`
-				User   struct {
-					ID string `json:"id"`
-				} `json:"user"`
 				LastActiveToken struct {
 					JWT string `json:"jwt"`
 				} `json:"last_active_token"`
@@ -138,66 +141,50 @@ func (c *Client) refreshSessionID() error {
 		} `json:"response"`
 	}
 
-	if err := json.NewDecoder(resp.Body).Decode(&clientResp); err != nil {
-		return fmt.Errorf("failed to decode refresh response: %w", err)
+	if err := json.Unmarshal(bodyBytes, &clientResp); err != nil {
+		return "", fmt.Errorf("failed to decode clerk response: %w\nbody: %s", err, string(bodyBytes))
 	}
 
 	if len(clientResp.Response.Sessions) == 0 {
-		return fmt.Errorf("no active sessions found after refresh")
+		return "", fmt.Errorf("no active sessions found. body: %s", string(bodyBytes))
 	}
 
-	newSessionID := clientResp.Response.LastActiveSessionID
-	if newSessionID == "" {
-		newSessionID = clientResp.Response.Sessions[0].ID
+	// 找到 last_active_session 对应的 session，优先取它的 JWT
+	targetSessionID := clientResp.Response.LastActiveSessionID
+	var jwt string
+	for _, s := range clientResp.Response.Sessions {
+		if s.ID == targetSessionID || targetSessionID == "" {
+			jwt = s.LastActiveToken.JWT
+			targetSessionID = s.ID
+			break
+		}
+	}
+	if jwt == "" {
+		// fallback: 取第一个 session 的 JWT
+		jwt = clientResp.Response.Sessions[0].LastActiveToken.JWT
+		targetSessionID = clientResp.Response.Sessions[0].ID
+	}
+	if jwt == "" {
+		return "", fmt.Errorf("JWT is empty in clerk response. body: %s", string(bodyBytes))
 	}
 
-	log.Printf("Successfully fetched session for %s: session_id=%s", c.config.Email, newSessionID)
+	log.Printf("成功获取 JWT for %s (session: %s)", c.config.Email, targetSessionID)
 
-	if newSessionID != c.config.SessionID {
-		c.config.SessionID = newSessionID
-		if c.account != nil && c.account.ID > 0 {
-			if err := c.store.UpdateSessionID(c.account.ID, newSessionID); err != nil {
-				log.Printf("警告: 更新数据库 session_id 失败: %v", err)
+	// 持久化最新 session_id
+	if targetSessionID != c.config.SessionID {
+		c.config.SessionID = targetSessionID
+		if c.account != nil && c.account.ID > 0 && c.store != nil {
+			if dbErr := c.store.UpdateSessionID(c.account.ID, targetSessionID); dbErr != nil {
+				log.Printf("警告: 更新数据库 session_id 失败: %v", dbErr)
 			}
 		}
 	}
 
-	return nil
+	return jwt, nil
 }
 
 func (c *Client) GetToken() (string, error) {
-	// 每次请求前先用 client_cookie 刷新 session_id，防止 session 过期
-	if err := c.refreshSessionID(); err != nil {
-		log.Printf("警告: 刷新 session 失败: %v，尝试使用已有 session_id", err)
-	}
-
-	url := fmt.Sprintf("https://clerk.orchids.app/v1/client/sessions/%s/tokens?__clerk_api_version=2025-11-10&_clerk_js_version=5.117.0", c.config.SessionID)
-
-	req, err := http.NewRequest("POST", url, strings.NewReader("organization_id="))
-	if err != nil {
-		return "", err
-	}
-
-	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
-	req.Header.Set("Cookie", c.config.GetCookies())
-
-	resp, err := c.httpClient.Do(req)
-	if err != nil {
-		return "", err
-	}
-	defer resp.Body.Close()
-
-	if resp.StatusCode != http.StatusOK {
-		body, _ := io.ReadAll(resp.Body)
-		return "", fmt.Errorf("token request failed with status %d: %s", resp.StatusCode, string(body))
-	}
-
-	var tokenResp TokenResponse
-	if err := json.NewDecoder(resp.Body).Decode(&tokenResp); err != nil {
-		return "", err
-	}
-
-	return tokenResp.JWT, nil
+	return c.refreshAndGetToken()
 }
 
 func (c *Client) SendRequest(ctx context.Context, prompt string, chatHistory []interface{}, model string, onMessage func(SSEMessage), logger *debug.Logger) error {
